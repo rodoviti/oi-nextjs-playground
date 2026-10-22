@@ -1,0 +1,77 @@
+{
+  "name": "SPID OIDC Playground",
+  "dockerComposeFile": "compose.yaml",
+  "service": "app",
+  "runServices": ["certificates", "app", "traefik"],
+  "workspaceFolder": "/workspaces/oi-nextjs-playground",
+  "shutdownAction": "stopCompose",
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "22"
+    },
+    "ghcr.io/devcontainers/features/github-cli:1": {},
+    "ghcr.io/pagopa/devcontainer-features/trivy:1": {},
+    "ghcr.io/devcontainers/features/copilot-cli:1": {},
+  },
+  "remoteUser": "vscode",
+  "portsAttributes": {
+    "3000": {
+      "label": "HTTPS via Traefik (Docker)",
+      "onAutoForward": "ignore"
+    }
+  },
+  "postCreateCommand": "npm ci",
+  "waitFor": "postCreateCommand",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "-ms-azuretools.vscode-azureterraform",
+        "ms-azuretools.vscode-azure-github-copilot",
+        "ms-vscode.vscode-websearchforcopilot",
+        "ms-azuretools.vscode-azureterraform",
+        "github.vscode-pull-request-github",
+        "esbenp.prettier-vscode",
+        "EditorConfig.EditorConfig",
+        "bruno-api-client.bruno",
+        "vitest.explorer",
+        "redhat.vscode-yaml",
+        "dbaeumer.vscode-eslint",
+        "github.copilot",
+        "github.copilot-chat",
+        "ms-vsliveshare.vsliveshare",
+        "eamodio.gitlens"
+      ],
+      "settings": {
+        "editor.formatOnSave": true,
+        "editor.defaultFormatter": "esbenp.prettier-vscode",
+        "editor.codeActionsOnSave": {
+          "source.fixAll.eslint": "explicit",
+          "source.organizeImports": "explicit"
+        },
+        "eslint.enable": true,
+        "eslint.probe": ["typescript"],
+        "eslint.workingDirectories": [{ "mode": "auto" }],
+      },
+      "mcp": {
+        "servers": {
+          "dx": {
+            "type": "http",
+            "url": "https://api.dx.pagopa.it/mcp"
+          },
+          "azure-learn": {
+            "type": "http",
+            "url": "https://learn.microsoft.com/api/mcp"
+          },
+          "atlassian": {
+            "type": "http",
+            "url": "https://mcp.atlassian.com/v1/mcp"
+          },
+          "github": {
+            "type": "http",
+            "url": "https://api.githubcopilot.com/mcp/"
+          }
+        }
+      }
+    }
+  }
+}

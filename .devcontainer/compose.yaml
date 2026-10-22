@@ -1,0 +1,49 @@
+services:
+  certificates:
+    build:
+      context: ./mkcert
+    environment:
+      CAROOT: /ca
+      CERT_DIR: /certs
+    volumes:
+      - mkcert-ca:/ca
+      - ./certs:/certs
+
+  app:
+    image: mcr.microsoft.com/devcontainers/base:debian@sha256:a07f1804d8e665ff64bf6adcd60f4d9b9223dc52ee18a1f1a7a8e1ee1a134d34
+    command: sleep infinity
+    init: true
+    depends_on:
+      certificates:
+        condition: service_completed_successfully
+    working_dir: /workspaces/oi-nextjs-playground
+    volumes:
+      - ..:/workspaces/oi-nextjs-playground:cached
+    expose:
+      - "3000"
+
+  traefik:
+    image: traefik:v3.7.16
+    command:
+      - --configFile=/etc/traefik/traefik.yaml
+    depends_on:
+      certificates:
+        condition: service_completed_successfully
+      app:
+        condition: service_started
+    ports:
+      - "127.0.0.1:3000:8443"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      # Existing mkcert keys can be mode 0600 and owned by the host user.
+      - DAC_OVERRIDE
+    volumes:
+      - ./traefik:/etc/traefik:ro
+      - ./certs:/certs:ro
+
+volumes:
+  mkcert-ca:

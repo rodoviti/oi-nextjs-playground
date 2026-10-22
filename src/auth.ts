@@ -1,4 +1,7 @@
-import NextAuth from "next-auth";
+import { betterAuth } from "better-auth";
 import { createAuthConfig } from "./auth.config";
 
-export const { auth, handlers, signIn, signOut } = NextAuth(() => createAuthConfig());
+export function getAuth() {
+  // Without a database, Better Auth uses memory internally; keep it request-local.
+  return betterAuth(createAuthConfig());
+}

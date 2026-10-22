@@ -3,7 +3,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "SPID OIDC Playground",
-  description: "PoC Next.js e Auth.js per login SPID L2/L3 e step-up.",
+  description: "PoC Next.js e Better Auth per login SPID L2/L3 e step-up.",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {

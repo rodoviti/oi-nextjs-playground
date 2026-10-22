@@ -16,8 +16,8 @@ export default defineConfig({
       url: "http://localhost:3100",
       reuseExistingServer: false,
       env: {
-        AUTH_URL: "http://localhost:3100",
-        AUTH_SECRET: "e2e-only-secret-not-for-production-32-characters",
+        BETTER_AUTH_URL: "http://localhost:3100",
+        BETTER_AUTH_SECRET: "e2e-only-secret-not-for-production-32-characters",
         OIDC_ISSUER: "http://localhost:4100",
         OIDC_CLIENT_ID: "test-client",
         OIDC_CLIENT_SECRET: "test-secret",

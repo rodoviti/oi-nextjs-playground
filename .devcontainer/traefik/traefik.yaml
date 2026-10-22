@@ -1,0 +1,15 @@
+global:
+  checkNewVersion: false
+  sendAnonymousUsage: false
+
+entryPoints:
+  websecure:
+    address: ":8443"
+
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yaml
+    watch: true
+
+log:
+  level: INFO

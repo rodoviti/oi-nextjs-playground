@@ -6,6 +6,7 @@ import { exportJWK, generateKeyPair, SignJWT } from "jose";
 async function main() {
   const issuer = "http://localhost:4100";
   const { privateKey, publicKey } = await generateKeyPair("RS256");
+  const wrongKey = await generateKeyPair("RS256");
   const jwk = { ...await exportJWK(publicKey), kid: "test-key", alg: "RS256", use: "sig" };
   const codes = new Map<string, URLSearchParams>();
   let mode = "normal";
@@ -39,11 +40,14 @@ async function main() {
           return;
         }
         const target = new URL(callback!);
-        target.searchParams.set("state", url.searchParams.get("state")!);
+        if (mode !== "missing-state") {
+          target.searchParams.set("state", mode === "wrong-state" ? "wrong-state" : url.searchParams.get("state")!);
+        }
         if (mode === "cancel") {
           target.searchParams.set("error", "access_denied");
         } else {
           const code = randomUUID();
+          if (mode === "wrong-pkce") url.searchParams.set("code_challenge", "wrong-challenge");
           codes.set(code, url.searchParams);
           target.searchParams.set("code", code);
         }
@@ -70,21 +74,24 @@ async function main() {
           sub: "synthetic-user",
           name: "Utente Demo",
           email: "demo@example.test",
-          nonce: authorization.get("nonce"),
+          nonce: mode === "wrong-nonce" ? "wrong-nonce" : authorization.get("nonce"),
           auth_time: Math.floor(Date.now() / 1000),
         };
         if (mode !== "missing-acr") {
-          claims.acr = mode === "lower-acr"
+          claims.acr = mode === "unknown-acr" ? "urn:unknown:acr"
+            : mode === "higher-acr" ? "https://www.spid.gov.it/SpidL3"
+            : mode === "lower-acr"
             ? "https://www.spid.gov.it/SpidL2"
             : authorization.get("acr_values");
         }
+        if (mode === "missing-email") delete claims.email;
         const idToken = await new SignJWT(claims)
           .setProtectedHeader({ alg: "RS256", kid: "test-key" })
-          .setIssuer(issuer)
-          .setAudience("test-client")
+          .setIssuer(mode === "wrong-issuer" ? "https://other.example.test" : issuer)
+          .setAudience(mode === "wrong-audience" ? "other-client" : "test-client")
           .setIssuedAt()
           .setExpirationTime("5m")
-          .sign(privateKey);
+          .sign(mode === "wrong-signature" ? wrongKey.privateKey : privateKey);
         res.end(JSON.stringify({
           access_token: "synthetic-access-token",
           token_type: "Bearer",
@@ -100,7 +107,7 @@ async function main() {
     }
   });
 
-  server.listen(4100, "localhost", () => console.log(`Test IdP ready at ${issuer}`));
+  server.listen(4100, "127.0.0.1", () => console.log(`Test IdP ready at ${issuer}`));
 }
 
 main().catch((error) => {

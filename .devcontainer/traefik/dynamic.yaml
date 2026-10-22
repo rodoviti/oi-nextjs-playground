@@ -1,0 +1,19 @@
+http:
+  routers:
+    nextjs:
+      rule: "Host(`localhost`)"
+      entryPoints:
+        - websecure
+      service: nextjs
+      tls: {}
+  services:
+    nextjs:
+      loadBalancer:
+        passHostHeader: true
+        servers:
+          - url: http://app:3000
+
+tls:
+  certificates:
+    - certFile: /certs/localhost.pem
+      keyFile: /certs/localhost-key.pem
