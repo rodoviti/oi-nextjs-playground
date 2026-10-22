@@ -41,3 +41,22 @@ export function achievedLevel(acr: unknown, settings: OidcSettings): SpidLevel |
 export function satisfiesLevel(actual: SpidLevel | null, requested: SpidLevel): boolean {
   return actual === "L3" || (actual === "L2" && requested === "L2");
 }
+
+export function loginErrorMessage(code: unknown): string {
+  switch (code) {
+    case "InsufficientAcr":
+      return "Il livello restituito dall'IdP non soddisfa quello richiesto.";
+    case "IdentityMismatch":
+      return "L'identita' OIDC restituita dall'IdP non corrisponde all'utente registrato. Il collegamento e' stato rifiutato.";
+    case "InvalidIdentity":
+      return "L'IdP ha restituito un'identita' OIDC non valida.";
+    case "access_denied":
+      return "Accesso negato o annullato presso l'IdP.";
+    case "LoginFailed":
+      return "Login non completato. Nessun JWT ricevuto dal callback.";
+    default:
+      return typeof code === "string" && /^[A-Za-z0-9_-]{1,80}$/.test(code)
+        ? `Login non completato (errore: ${code}).`
+        : "Login non completato. Controllare i log del server.";
+  }
+}

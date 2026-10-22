@@ -71,7 +71,7 @@ async function main() {
           return;
         }
         const claims: Record<string, unknown> = {
-          sub: "synthetic-user",
+          sub: mode === "different-subject" ? "different-user" : "synthetic-user",
           name: "Utente Demo",
           email: "demo@example.test",
           nonce: mode === "wrong-nonce" ? "wrong-nonce" : authorization.get("nonce"),

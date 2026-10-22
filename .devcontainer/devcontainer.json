@@ -2,7 +2,7 @@
   "name": "SPID OIDC Playground",
   "dockerComposeFile": "compose.yaml",
   "service": "app",
-  "runServices": ["certificates", "app", "traefik"],
+  "runServices": ["postgres", "redis", "certificates", "app", "traefik"],
   "workspaceFolder": "/workspaces/oi-nextjs-playground",
   "shutdownAction": "stopCompose",
   "features": {
@@ -11,7 +11,7 @@
     },
     "ghcr.io/devcontainers/features/github-cli:1": {},
     "ghcr.io/pagopa/devcontainer-features/trivy:1": {},
-    "ghcr.io/devcontainers/features/copilot-cli:1": {},
+    "ghcr.io/devcontainers/features/copilot-cli:1": {}
   },
   "remoteUser": "vscode",
   "portsAttributes": {
@@ -21,7 +21,8 @@
     }
   },
   "postCreateCommand": "npm ci",
-  "waitFor": "postCreateCommand",
+  "postStartCommand": "npm run db:migrate",
+  "waitFor": "postStartCommand",
   "customizations": {
     "vscode": {
       "extensions": [
@@ -50,7 +51,7 @@
         },
         "eslint.enable": true,
         "eslint.probe": ["typescript"],
-        "eslint.workingDirectories": [{ "mode": "auto" }],
+        "eslint.workingDirectories": [{ "mode": "auto" }]
       },
       "mcp": {
         "servers": {

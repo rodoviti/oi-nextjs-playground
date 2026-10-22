@@ -1,7 +1,6 @@
 import type { BetterAuthOptions } from "better-auth";
 import { APIError, createAuthMiddleware } from "better-auth/api";
-import { nextCookies } from "better-auth/next-js";
-import { customSession, genericOAuth } from "better-auth/plugins";
+import { genericOAuth } from "better-auth/plugins";
 import { decodeJwt } from "jose";
 import {
   achievedLevel,
@@ -9,36 +8,37 @@ import {
   satisfiesLevel,
   SPID_LEVELS,
 } from "./lib/oidc";
-import { projectSession, SESSION_TTL } from "./lib/session";
+import { getDatabase } from "./lib/database";
+import { issueToken, jwtPlugin } from "./lib/jwt";
+import { LOGIN_REQUEST_PATTERN, loginResponse } from "./lib/login-response";
+import { sessionFields, userFields } from "./lib/auth-schema";
+import { SESSION_TTL, type LoginIdentity } from "./lib/session";
 
 export function createAuthConfig() {
   const settings = readOidcSettings();
+  let identity: LoginIdentity | undefined;
 
   const options = {
+    database: getDatabase(),
     session: {
       expiresIn: SESSION_TTL,
       disableSessionRefresh: true,
-      cookieCache: {
-        enabled: true,
-        strategy: "jwe",
-        maxAge: SESSION_TTL,
-        refreshCache: false,
-      },
+      cookieCache: { enabled: false },
+      additionalFields: sessionFields,
     },
     account: {
       storeStateStrategy: "cookie",
       storeAccountCookie: false,
-      accountLinking: { enabled: false },
+      updateAccountOnSignIn: false,
+      accountLinking: {
+        enabled: true,
+        trustedProviders: ["spid-l2", "spid-l3"],
+        requireLocalEmailVerified: false,
+      },
     },
     user: {
-      additionalFields: {
-        subject: { type: "string", required: true },
-        level: { type: "string", required: true },
-        acr: { type: "string", required: true },
-        provider: { type: "string", required: true },
-        authTime: { type: "number", required: false },
-      },
-      validateUserInfo: ({ source }) => {
+      additionalFields: userFields,
+      validateUserInfo: async ({ user, source }) => {
         const provider = source.oauth?.providerId;
         const profile = source.oauth?.profile;
         const requested = provider === "spid-l3" ? "L3" : "L2";
@@ -54,16 +54,58 @@ export function createAuthConfig() {
           );
           return { error: "InsufficientAcr" };
         }
+        if (!actual || !provider || typeof profile?.sub !== "string" || profile.iss !== settings.issuer) {
+          return { error: "InvalidIdentity" };
+        }
+        if (source.action !== "create-user") {
+          const existing = await getDatabase().query<{ subject: string; issuer: string }>(
+            'SELECT subject, issuer FROM "user" WHERE id = $1', [user.id],
+          );
+          const binding = existing.rows[0];
+          if (binding?.subject !== profile.sub || binding?.issuer !== settings.issuer) {
+            console.warn("[auth] Refusing account binding to a different OIDC identity", {
+              action: source.action,
+              provider,
+              userFound: !!binding,
+              subjectMatches: binding?.subject === profile.sub,
+              issuerMatches: binding?.issuer === settings.issuer,
+            });
+            return { error: "IdentityMismatch" };
+          }
+        }
+        identity = {
+          subject: profile.sub,
+          issuer: settings.issuer,
+          level: actual,
+          acr: settings.acr[actual],
+          provider,
+          ...(typeof profile.auth_time === "number" ? { authTime: profile.auth_time } : {}),
+        };
       },
     },
-    onAPIError: { errorURL: "/" },
+    onAPIError: { errorURL: "/auth/complete" },
     databaseHooks: {
+      account: {
+        create: {
+          before: async () => ({
+            data: {
+              accessToken: null,
+              refreshToken: null,
+              idToken: null,
+              accessTokenExpiresAt: null,
+              refreshTokenExpiresAt: null,
+            },
+          }),
+        },
+      },
       session: {
         create: {
           before: async () => {
+            if (!identity) throw new Error("Session creation requires verified OIDC identity");
             const startedAt = Math.floor(Date.now() / 1000) * 1000;
             return {
               data: {
+                ...identity,
                 createdAt: new Date(startedAt),
                 updatedAt: new Date(startedAt),
                 expiresAt: new Date(startedAt + SESSION_TTL * 1000),
@@ -75,15 +117,14 @@ export function createAuthConfig() {
     },
     hooks: {
       before: createAuthMiddleware(async (ctx) => {
-        // This PoC exposes login, local logout and read-only session access only.
-        if (
+        // Public auth routes are further restricted by the Next.js route handler.
+        if (ctx.path && (
           ![
             "/sign-in/social",
-            "/sign-out",
-            "/get-session",
             "/callback/:id",
+            "/jwks",
           ].includes(ctx.path)
-        ) {
+        )) {
           throw new APIError("NOT_FOUND", {
             message: "Unsupported authentication endpoint",
           });
@@ -95,14 +136,20 @@ export function createAuthConfig() {
         }
       }),
       after: createAuthMiddleware(async (ctx) => {
-        const session = ctx.context.session?.session;
-        // Better Auth's cookie decoder has clock tolerance; enforce the exact deadline.
-        if (
-          ctx.path === "/get-session" &&
-          session &&
-          session.expiresAt.getTime() <= Date.now()
-        ) {
-          return ctx.json(null);
+        if (ctx.path === "/callback/:id" && ctx.context.newSession) {
+          const location = ctx.context.responseHeaders?.get("location");
+          if (!location) throw new Error("Missing OIDC callback destination");
+          const target = new URL(location, ctx.context.baseURL);
+          const requestId = target.searchParams.get("requestId");
+          if (
+            target.origin !== new URL(ctx.context.baseURL).origin ||
+            target.pathname !== "/auth/complete" || !requestId || !LOGIN_REQUEST_PATTERN.test(requestId)
+          ) {
+            throw new Error("Invalid OIDC login destination");
+          }
+          const { token } = await issueToken(ctx.context.newSession.session.id);
+          ctx.context.responseHeaders?.delete("location");
+          return loginResponse(target.origin, requestId, token);
         }
       }),
     },
@@ -111,6 +158,7 @@ export function createAuthConfig() {
   return {
     ...options,
     plugins: [
+      jwtPlugin(),
       genericOAuth({
         config: SPID_LEVELS.map((level) => ({
           providerId: `spid-${level.toLowerCase()}`,
@@ -150,20 +198,10 @@ export function createAuthConfig() {
           },
           mapProfileToUser: (profile) => ({
             subject: profile.sub,
-            level: achievedLevel(profile.acr, settings),
-            acr: profile.acr,
-            provider: `spid-${level.toLowerCase()}`,
-            ...(typeof profile.auth_time === "number"
-              ? { authTime: profile.auth_time }
-              : {}),
+            issuer: settings.issuer,
           }),
         })),
       }),
-      customSession(
-        async ({ user, session }) => projectSession({ user, session }),
-        options,
-      ),
-      nextCookies(),
     ],
   };
 }

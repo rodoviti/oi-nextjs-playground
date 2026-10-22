@@ -1,7 +1,51 @@
 services:
+  postgres:
+    image: postgres:17
+    networks:
+      - default
+    environment:
+      POSTGRES_USER: playground
+      POSTGRES_DB: playground
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U playground -d playground"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7.4
+    networks:
+      - default
+    command:
+      [
+        "redis-server",
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "always",
+        "--maxmemory-policy",
+        "noeviction",
+      ]
+    volumes:
+      - redis-data:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
   certificates:
     build:
       context: ./mkcert
+    networks:
+      - default
     environment:
       CAROOT: /ca
       CERT_DIR: /certs
@@ -11,12 +55,21 @@ services:
 
   app:
     image: mcr.microsoft.com/devcontainers/base:debian@sha256:a07f1804d8e665ff64bf6adcd60f4d9b9223dc52ee18a1f1a7a8e1ee1a134d34
+    networks:
+      - default
     command: sleep infinity
     init: true
     depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
       certificates:
         condition: service_completed_successfully
     working_dir: /workspaces/oi-nextjs-playground
+    environment:
+      DATABASE_URL: postgres://playground:${POSTGRES_PASSWORD:-password}@postgres:5432/playground
+      REDIS_URL: redis://redis:6379
     volumes:
       - ..:/workspaces/oi-nextjs-playground:cached
     expose:
@@ -24,6 +77,8 @@ services:
 
   traefik:
     image: traefik:v3.7.16
+    networks:
+      - default
     command:
       - --configFile=/etc/traefik/traefik.yaml
     depends_on:
@@ -45,5 +100,11 @@ services:
       - ./traefik:/etc/traefik:ro
       - ./certs:/certs:ro
 
+networks:
+  default:
+    driver: bridge
+
 volumes:
   mkcert-ca:
+  postgres-data:
+  redis-data:
