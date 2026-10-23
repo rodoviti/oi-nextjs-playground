@@ -135,8 +135,8 @@ revoca richiesta. I normali endpoint cookie `/api/auth/get-session`,
 | --- | --- |
 | `GET /api/auth/jwks` | JWKS pubblico, nessun token richiesto |
 | `POST /api/login` | Avvio login popup, JSON `{ "level": "L2", "requestId": "..." }` |
-| `POST /api/magic-link/generate` | Genera un JWE monouso, richiede Bearer JWT valido |
-| `POST /api/magic-link` | Login custom, JSON `{ "jwe": "..." }`, restituisce `{ "token", "session" }` |
+| `POST /api/magic-link/generate` | Genera un token opaco monouso, richiede Bearer JWT valido |
+| `POST /api/magic-link` | Login custom, JSON `{ "token": "..." }`, restituisce `{ "token", "session" }` |
 | `GET /api/session` | Identita' e metadati del JWT, richiede Bearer |
 | `GET /api/example` | Esempio di API protetta, richiede Bearer |
 | `POST /api/logout` | Revoca della sessione corrente, richiede Bearer |
@@ -160,7 +160,7 @@ non quelli di altre login e non la sessione IdP. Il record PostgreSQL viene
 conservato per una futura correlazione con audit log; gli audit log non sono
 ancora implementati. La UI dimentica il JWT solo dopo il successo del logout.
 
-Redis e' un servizio dedicato alla denylist e ai magic link monouso, non la
+Redis e' un servizio dedicato alla denylist delle sessioni, non la
 `secondaryStorage` delle sessioni Better Auth: le sessioni restano in PostgreSQL.
 Se Redis o PostgreSQL necessari all'operazione non sono disponibili, le API
 restituiscono **503**, non autorizzano richieste e non simulano un logout riuscito.
@@ -183,22 +183,26 @@ consente sessioni senza livello SPID, mantenendo invariati i vincoli per OIDC.
 
 Il provider custom usa le stesse sessioni PostgreSQL, firma RS256 Better Auth,
 JWKS e revoca dei JWT OIDC, senza discovery o contatto con l'IdP.
-Non invia email e non genera URL: il JWE e' una credenziale da consegnare
+Non invia email e non genera URL: il token opaco e' una credenziale da consegnare
 tramite un canale sicuro e presentare nel body JSON.
 
 1. `POST /api/magic-link/generate` con `Authorization: Bearer <JWT>` verifica
    il JWT attivo e la sessione sorgente. Risponde con
-   `{ "jwe": "...", "expiresAt": "..." }`; il JWE dura **86.400 secondi**.
+   `{ "token": "...", "expiresAt": "..." }`; la credenziale dura **86.400 secondi**.
 2. `POST /api/magic-link` con `Content-Type: application/json` e
-   `{ "jwe": "..." }` riscatta la credenziale una sola volta.
+   `{ "token": "..." }` riscatta la credenziale una sola volta.
 3. Viene creata una nuova sessione indipendente di **3.600 secondi** e
    restituito `{ "token": "...", "session": { ... } }`.
 
-Il JWE usa `dir`/`A256GCM`, con chiave derivata tramite HKDF-SHA256 dal segreto
-risolto nativamente da Better Auth (`BETTER_AUTH_SECRET`) e contesto dedicato.
-E' cifrato e autenticato, non un JWS firmato. Issuer, audience specifica,
-purpose, tipo, scadenza e riferimento alla sessione vengono verificati.
-Non contiene il JWT sorgente o token dell'IdP.
+La credenziale contiene 32 byte casuali (256 bit) codificati base64url e non
+contiene dati utente o JWT. Non e' un JWE e non richiede una chiave di cifratura.
+Better Auth salva nella tabella PostgreSQL `verification` un identificativo
+`magic-link:<SHA-256 del token>`, il riferimento alla sessione sorgente, il
+subject e la scadenza. Il token originale non viene conservato.
+Il riscatto usa `consumeVerificationValue()` per impedire replay e riscatti
+concorrenti; viene verificata anche la scadenza esatta, senza tolleranza.
+Il plugin email `magicLink()` non viene utilizzato: il flusso resta custom,
+riusando verification, sessioni e firma JWT della libreria.
 
 La sorgente puo' essere scaduta al riscatto, ma deve esistere e non essere
 revocata. Il record PostgreSQL conservato permette di rilevare una revoca
@@ -214,12 +218,18 @@ Un JWT magic-link attivo puo' generare a sua volta un nuovo magic link;
 questo flusso consente quindi di proseguire l'accesso oltre la login SPID
 originaria senza attestare una nuova autenticazione SPID.
 
-Redis conserva `magic-link:<jti>` fino alla scadenza; il consumo atomico
-impedisce replay e riscatti concorrenti. Se un errore avviene dopo il consumo,
-il link resta consumato e l'API segnala il fallimento: non viene ripristinato.
-Gli errori infrastrutturali restituiscono 503. Non registrare JWE/JWT o body
+La verifica viene consumata prima di controllare la sorgente e creare la nuova
+sessione. Se un errore avviene dopo il consumo, anche durante il controllo della
+sorgente, il link resta consumato e l'API segnala il fallimento: non viene
+ripristinato. Gli errori infrastrutturali restituiscono 503.
+Non registrare token magic link, JWT o body
 degli endpoint nei log; non inserirli negli URL. Non esiste autenticazione
 tramite cookie ne' viene introdotto storage persistente nel frontend.
+
+Questa versione cambia il contratto da `{ "jwe": "..." }` a
+`{ "token": "..." }`: i precedenti JWE non sono piu' accettati.
+Non serve una nuova migrazione rispetto a `002_magic_link.sql`, perche'
+la tabella `verification` esiste gia'. Redis resta necessario per la revoca.
 
 ## Dev Container e HTTPS
 

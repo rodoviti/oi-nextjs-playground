@@ -1,16 +1,14 @@
-import { hkdfSync, randomUUID } from "node:crypto";
-import { EncryptJWT, errors, jwtDecrypt } from "jose";
+import { createHash, randomBytes } from "node:crypto";
 import { getDatabase } from "./database";
 import { getRedis } from "./redis";
-import { appOrigin, authenticate, HttpError, issueToken, tokenAuthContext } from "./jwt";
+import { authenticate, HttpError, issueToken, tokenAuthContext } from "./jwt";
 import { SESSION_TTL, type PersistedSession } from "./session";
 
 export const MAGIC_LINK_TTL = 86400;
 const PURPOSE = "magic-link";
 
-async function encryptionKey() {
-  const { secret } = await tokenAuthContext();
-  return new Uint8Array(hkdfSync("sha256", secret, "oi-nextjs-playground", PURPOSE, 32));
+function identifier(token: string) {
+  return `${PURPOSE}:${createHash("sha256").update(token).digest("hex")}`;
 }
 
 async function sourceSession(id: string) {
@@ -27,53 +25,37 @@ async function sourceSession(id: string) {
 export async function generateMagicLink(request: Request) {
   const { session } = await authenticate(request);
   await sourceSession(session.id);
-  const origin = await appOrigin();
-  const now = Math.floor(Date.now() / 1000);
-  const expiresAt = now + MAGIC_LINK_TTL;
-  const id = randomUUID();
-  const jwe = await new EncryptJWT({ sid: session.id, purpose: PURPOSE })
-    .setProtectedHeader({ alg: "dir", enc: "A256GCM", typ: "magic-link+jwe" })
-    .setIssuer(origin).setAudience(`${origin}/api/magic-link`)
-    .setSubject(session.user.id).setJti(id).setIssuedAt(now).setExpirationTime(expiresAt)
-    .encrypt(await encryptionKey());
-  const reserved = await (await getRedis()).set(`magic-link:${id}`, session.id, { NX: true, EXAT: expiresAt });
-  if (reserved !== "OK") throw new Error("Unable to reserve magic link");
-  return { jwe, expiresAt: new Date(expiresAt * 1000).toISOString() };
+  const token = randomBytes(32).toString("base64url");
+  const expiresAt = new Date(Math.floor(Date.now() / 1000) * 1000 + MAGIC_LINK_TTL * 1000);
+  const context = await tokenAuthContext();
+  const verification = await context.internalAdapter.createVerificationValue({
+    identifier: identifier(token),
+    value: JSON.stringify({ sessionId: session.id, subject: session.user.id }),
+    expiresAt,
+  });
+  if (!verification) throw new Error("Unable to store magic-link verification");
+  return { token, expiresAt: expiresAt.toISOString() };
 }
 
-export async function redeemMagicLink(jwe: unknown) {
-  if (typeof jwe !== "string" || jwe.length > 8192 || jwe.split(".").length !== 5) {
-    throw new HttpError(400, "JWE richiesto o formato non valido");
+export async function redeemMagicLink(token: unknown) {
+  if (typeof token !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(token)) {
+    throw new HttpError(400, "Token magic link richiesto o formato non valido");
   }
-  const origin = await appOrigin();
-  const key = await encryptionKey();
-  let payload;
-  try {
-    const decrypted = await jwtDecrypt(jwe, key, {
-      issuer: origin, audience: `${origin}/api/magic-link`,
-      keyManagementAlgorithms: ["dir"], contentEncryptionAlgorithms: ["A256GCM"],
-      requiredClaims: ["sub", "sid", "jti", "iat", "exp"], clockTolerance: 0,
-    });
-    if (decrypted.protectedHeader.typ !== "magic-link+jwe") {
-      throw new HttpError(401, "Tipo JWE non valido");
-    }
-    payload = decrypted.payload;
-  } catch (error) {
-    if (error instanceof errors.JOSEError) throw new HttpError(401, "Magic link non valido o scaduto");
-    throw error;
-  }
-  if (
-    payload.purpose !== PURPOSE || typeof payload.sid !== "string" ||
-    typeof payload.sub !== "string" || typeof payload.jti !== "string" ||
-    typeof payload.iat !== "number" || typeof payload.exp !== "number" ||
-    payload.exp - payload.iat !== MAGIC_LINK_TTL || payload.iat > Math.floor(Date.now() / 1000)
-  ) throw new HttpError(401, "Claim magic link non validi");
-  const source = await sourceSession(payload.sid);
-  if (source.subject !== payload.sub) throw new HttpError(401, "Identita' magic link non valida");
-  const consumed = await (await getRedis()).getDel(`magic-link:${payload.jti}`);
-  if (consumed !== source.id) throw new HttpError(401, "Magic link gia' utilizzato o non valido");
-
   const context = await tokenAuthContext();
+  const verification = await context.internalAdapter.consumeVerificationValue(identifier(token));
+  // Better Auth accepts expiresAt === now; enforce the API's exact expiry boundary.
+  if (!verification || verification.expiresAt.getTime() <= Date.now()) {
+    throw new HttpError(401, "Magic link gia' utilizzato, scaduto o non valido");
+  }
+  const payload: unknown = JSON.parse(verification.value);
+  if (
+    !payload || typeof payload !== "object" ||
+    !("sessionId" in payload) || typeof payload.sessionId !== "string" ||
+    !("subject" in payload) || typeof payload.subject !== "string"
+  ) throw new Error("Invalid stored magic-link verification");
+  const source = await sourceSession(payload.sessionId);
+  if (source.subject !== payload.subject) throw new HttpError(401, "Identita' magic link non valida");
+
   const startedAt = Math.floor(Date.now() / 1000) * 1000;
   const session = await context.internalAdapter.createSession(source.userId, false, {
     subject: source.subject, issuer: source.issuer,

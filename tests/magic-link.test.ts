@@ -1,25 +1,28 @@
+import { createHash } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { EncryptJWT, jwtDecrypt } from "jose";
-import { hkdfSync } from "node:crypto";
 import { generateMagicLink, MAGIC_LINK_TTL, redeemMagicLink } from "../src/lib/magic-link";
 
+type Verification = { identifier: string; value: string; expiresAt: Date };
 const state = vi.hoisted(() => ({
-  query: vi.fn(), exists: vi.fn(), set: vi.fn(), getDel: vi.fn(),
+  query: vi.fn(), exists: vi.fn(),
   authenticate: vi.fn(), createSession: vi.fn(), issueToken: vi.fn(),
-  secret: "test-secret-with-more-than-32-characters",
-  store: new Map<string, string>(),
+  createVerificationValue: vi.fn(), consumeVerificationValue: vi.fn(),
+  store: new Map<string, Verification>(),
 }));
 vi.mock("../src/lib/database", () => ({ getDatabase: () => ({ query: state.query }) }));
 vi.mock("../src/lib/redis", () => ({
-  getRedis: async () => ({ exists: state.exists, set: state.set, getDel: state.getDel }),
+  getRedis: async () => ({ exists: state.exists }),
 }));
 vi.mock("../src/lib/jwt", async (original) => ({
   ...await original<typeof import("../src/lib/jwt")>(),
-  appOrigin: async () => "https://app.example",
   authenticate: state.authenticate,
   issueToken: state.issueToken,
   tokenAuthContext: async () => ({
-    secret: state.secret, internalAdapter: { createSession: state.createSession },
+    internalAdapter: {
+      createSession: state.createSession,
+      createVerificationValue: state.createVerificationValue,
+      consumeVerificationValue: state.consumeVerificationValue,
+    },
   }),
 }));
 const start = 1_800_000_000;
@@ -38,36 +41,37 @@ beforeEach(() => {
   state.authenticate.mockReset().mockResolvedValue({ session: { id: source.id, user: { id: source.subject } } });
   state.createSession.mockReset().mockResolvedValue({ id: "new-session" });
   state.issueToken.mockReset().mockResolvedValue({ token: "signed-jwt", session: { provider: "magic-link" } });
-  state.set.mockReset().mockImplementation(async (key: string, value: string) => {
-    state.store.set(key, value); return "OK";
+  state.createVerificationValue.mockReset().mockImplementation(async (record: Verification) => {
+    state.store.set(record.identifier, record);
+    return record;
   });
-  state.getDel.mockReset().mockImplementation(async (key: string) => {
-    const value = state.store.get(key);
+  state.consumeVerificationValue.mockReset().mockImplementation(async (key: string) => {
+    const record = state.store.get(key);
     state.store.delete(key);
-    return value ?? null;
+    return record && record.expiresAt.getTime() >= Date.now() ? record : null;
   });
 });
 afterEach(() => vi.useRealTimers());
 
 describe("Magic-link authentication provider", () => {
-  it("encrypts a 24-hour credential with domain-separated BETTER_AUTH_SECRET", async () => {
+  it("stores only a hash of a random 256-bit credential through Better Auth verification", async () => {
     const result = await generateMagicLink(request);
-    const key = new Uint8Array(hkdfSync("sha256", state.secret, "oi-nextjs-playground", "magic-link", 32));
-    const { payload, protectedHeader } = await jwtDecrypt(result.jwe, key);
-    expect(protectedHeader).toEqual({ alg: "dir", enc: "A256GCM", typ: "magic-link+jwe" });
-    expect(payload).toMatchObject({
-      sid: "source", sub: "subject", purpose: "magic-link",
-      iss: "https://app.example", aud: "https://app.example/api/magic-link",
-      iat: start, exp: start + MAGIC_LINK_TTL,
+    expect(result.token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    const identifier = `magic-link:${createHash("sha256").update(result.token).digest("hex")}`;
+    expect(state.createVerificationValue).toHaveBeenCalledWith({
+      identifier, value: JSON.stringify({ sessionId: "source", subject: "subject" }),
+      expiresAt: new Date((start + MAGIC_LINK_TTL) * 1000),
     });
+    expect(JSON.stringify([...state.store.values()])).not.toContain(result.token);
     expect(result.expiresAt).toBe(new Date((start + MAGIC_LINK_TTL) * 1000).toISOString());
     expect(state.authenticate).toHaveBeenCalledWith(request);
+    expect((await generateMagicLink(request)).token).not.toBe(result.token);
   });
 
   it("redeems after source expiry into an independent one-hour session without SPID claims", async () => {
-    const { jwe } = await generateMagicLink(request);
+    const { token } = await generateMagicLink(request);
     vi.setSystemTime((start + 7200) * 1000);
-    expect(await redeemMagicLink(jwe)).toMatchObject({ token: "signed-jwt" });
+    expect(await redeemMagicLink(token)).toMatchObject({ token: "signed-jwt" });
     expect(state.createSession).toHaveBeenCalledWith("user-id", false, {
       subject: source.subject, issuer: source.issuer, provider: "magic-link",
       level: null, acr: null, authTime: null,
@@ -75,65 +79,87 @@ describe("Magic-link authentication provider", () => {
       expiresAt: new Date((start + 10800) * 1000),
     }, true);
     expect(state.issueToken).toHaveBeenCalledWith("new-session");
-    await expect(redeemMagicLink(jwe)).rejects.toMatchObject({ status: 401 });
+    await expect(redeemMagicLink(token)).rejects.toMatchObject({ status: 401 });
   });
 
   it("permits only one concurrent redemption", async () => {
-    const { jwe } = await generateMagicLink(request);
-    const results = await Promise.allSettled([redeemMagicLink(jwe), redeemMagicLink(jwe)]);
+    const { token } = await generateMagicLink(request);
+    const results = await Promise.allSettled([redeemMagicLink(token), redeemMagicLink(token)]);
     expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
     expect(state.createSession).toHaveBeenCalledTimes(1);
   });
 
-  it("rejects at the exact expiry and rejects tampered ciphertext", async () => {
-    const { jwe } = await generateMagicLink(request);
-    const parts = jwe.split(".");
-    parts[3] = (parts[3][0] === "A" ? "B" : "A") + parts[3].slice(1);
-    await expect(redeemMagicLink(parts.join("."))).rejects.toMatchObject({ status: 401 });
-    vi.setSystemTime((start + MAGIC_LINK_TTL) * 1000);
-    await expect(redeemMagicLink(jwe)).rejects.toMatchObject({ status: 401 });
+  it.each([MAGIC_LINK_TTL, MAGIC_LINK_TTL + 1])("rejects at expiry plus %i seconds", async (elapsed) => {
+    const { token } = await generateMagicLink(request);
+    vi.setSystemTime((start + elapsed) * 1000);
+    await expect(redeemMagicLink(token)).rejects.toMatchObject({ status: 401 });
     expect(state.createSession).not.toHaveBeenCalled();
   });
 
+  it("accepts immediately before the exact expiry boundary", async () => {
+    const { token } = await generateMagicLink(request);
+    vi.setSystemTime((start + MAGIC_LINK_TTL) * 1000 - 1);
+    await expect(redeemMagicLink(token)).resolves.toMatchObject({ token: "signed-jwt" });
+  });
+
   it.each(["database-revocation", "redis-revocation", "missing-source", "different-subject"])(
-    "rejects %s without consuming a link", async (mode) => {
-      const { jwe } = await generateMagicLink(request);
+    "rejects %s without creating a session", async (mode) => {
+      const { token } = await generateMagicLink(request);
       if (mode === "database-revocation") state.query.mockResolvedValue({ rows: [{ ...source, revokedAt: new Date() }] });
       if (mode === "redis-revocation") state.exists.mockResolvedValue(1);
       if (mode === "missing-source") state.query.mockResolvedValue({ rows: [] });
       if (mode === "different-subject") state.query.mockResolvedValue({ rows: [{ ...source, subject: "other" }] });
-      await expect(redeemMagicLink(jwe)).rejects.toMatchObject({ status: 401 });
-      expect(state.getDel).not.toHaveBeenCalled();
+      await expect(redeemMagicLink(token)).rejects.toMatchObject({ status: 401 });
       expect(state.createSession).not.toHaveBeenCalled();
+      expect(state.store.size).toBe(0);
     },
   );
 
-  it("fails closed on infrastructure errors and burns a link if session creation fails", async () => {
-    const { jwe } = await generateMagicLink(request);
-    state.getDel.mockRejectedValueOnce(new Error("Redis unavailable"));
-    await expect(redeemMagicLink(jwe)).rejects.toThrow("Redis unavailable");
-    expect(state.createSession).not.toHaveBeenCalled();
-    state.createSession.mockRejectedValueOnce(new Error("DB unavailable"));
-    await expect(redeemMagicLink(jwe)).rejects.toThrow("DB unavailable");
-    await expect(redeemMagicLink(jwe)).rejects.toMatchObject({ status: 401 });
+  it("propagates verification storage failures instead of returning a credential", async () => {
+    state.createVerificationValue.mockRejectedValueOnce(new Error("DB unavailable"));
+    await expect(generateMagicLink(request)).rejects.toThrow("DB unavailable");
+    state.createVerificationValue.mockResolvedValueOnce(null);
+    await expect(generateMagicLink(request)).rejects.toThrow("Unable to store");
+    state.authenticate.mockRejectedValueOnce(new Error("Invalid bearer"));
+    await expect(generateMagicLink(request)).rejects.toThrow("Invalid bearer");
   });
 
-  it("rejects wrong purpose, issuer, audience, algorithm, future issuance and lifetimes", async () => {
-    const key = new Uint8Array(hkdfSync("sha256", state.secret, "oi-nextjs-playground", "magic-link", 32));
-    for (const overrides of [
-      { purpose: "other" }, { iss: "https://evil.example" }, { aud: "other" },
-      { iat: start + 1 }, { exp: start + MAGIC_LINK_TTL + 1 },
-    ]) {
-      const jwe = await new EncryptJWT({
-        sub: "subject", sid: "source", jti: "id", iat: start, exp: start + MAGIC_LINK_TTL,
-        iss: "https://app.example", aud: "https://app.example/api/magic-link",
-        purpose: "magic-link", ...overrides,
-      }).setProtectedHeader({ alg: "dir", enc: "A256GCM", typ: "magic-link+jwe" }).encrypt(key);
-      await expect(redeemMagicLink(jwe)).rejects.toMatchObject({ status: 401 });
+  it("fails closed on consume errors and burns the token if session creation fails", async () => {
+    const { token } = await generateMagicLink(request);
+    state.consumeVerificationValue.mockRejectedValueOnce(new Error("DB unavailable"));
+    await expect(redeemMagicLink(token)).rejects.toThrow("DB unavailable");
+    expect(state.createSession).not.toHaveBeenCalled();
+    state.createSession.mockRejectedValueOnce(new Error("Session creation failed"));
+    await expect(redeemMagicLink(token)).rejects.toThrow("Session creation failed");
+    await expect(redeemMagicLink(token)).rejects.toMatchObject({ status: 401 });
+  });
+
+  it("fails closed when Redis revocation state is unavailable", async () => {
+    const { token } = await generateMagicLink(request);
+    state.exists.mockRejectedValueOnce(new Error("Redis unavailable"));
+    await expect(redeemMagicLink(token)).rejects.toThrow("Redis unavailable");
+    expect(state.createSession).not.toHaveBeenCalled();
+  });
+
+  it("rejects malformed, unknown and altered credentials", async () => {
+    for (const value of [undefined, null, "", "invalid", "x".repeat(44), ".".repeat(43)]) {
+      await expect(redeemMagicLink(value)).rejects.toMatchObject({ status: 400 });
     }
-    const wrongAlgorithm = await new EncryptJWT({}).setProtectedHeader({ alg: "dir", enc: "A128GCM" }).encrypt(key.slice(0, 16));
-    await expect(redeemMagicLink(wrongAlgorithm)).rejects.toMatchObject({ status: 401 });
-    await expect(redeemMagicLink("invalid")).rejects.toMatchObject({ status: 400 });
+    expect(state.consumeVerificationValue).not.toHaveBeenCalled();
+    const { token } = await generateMagicLink(request);
+    const altered = (token[0] === "A" ? "B" : "A") + token.slice(1);
+    await expect(redeemMagicLink(altered)).rejects.toMatchObject({ status: 401 });
+    await expect(redeemMagicLink("x".repeat(43))).rejects.toMatchObject({ status: 401 });
+    expect(state.createSession).not.toHaveBeenCalled();
+  });
+
+  it("surfaces corrupt stored verification data as an infrastructure error", async () => {
+    for (const value of ["invalid-json", "{}", '{"sessionId":123,"subject":"subject"}']) {
+      const { token } = await generateMagicLink(request);
+      const record = [...state.store.values()][0];
+      record.value = value;
+      await expect(redeemMagicLink(token)).rejects.toThrow();
+    }
     expect(state.createSession).not.toHaveBeenCalled();
   });
 });
