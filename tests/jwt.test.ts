@@ -56,6 +56,16 @@ function request(token: string) {
 }
 
 describe("Asymmetric bearer verification and revocation", () => {
+  it("accepts magic-link JWTs without SPID assurance and rejects mixed authentication claims", async () => {
+    const { acr, ...metadata } = session;
+    expect(acr).toBe("https://www.spid.gov.it/SpidL2");
+    const magic = { ...metadata, provider: "magic-link", level: null };
+    expect((await authenticate(request(await signed({ session: magic })))).session).toEqual(magic);
+    for (const extra of [{ level: "L3" }, { acr: "spid-l3" }, { authTime: start }]) {
+      await expect(authenticate(request(await signed({ session: { ...magic, ...extra } }))))
+        .rejects.toMatchObject({ status: 401 });
+    }
+  });
   it("validates signature and checks Redis on every request without renewing expiry", async () => {
     const token = await signed();
     for (const elapsed of [0, 1800, 3599]) {

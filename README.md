@@ -135,6 +135,8 @@ revoca richiesta. I normali endpoint cookie `/api/auth/get-session`,
 | --- | --- |
 | `GET /api/auth/jwks` | JWKS pubblico, nessun token richiesto |
 | `POST /api/login` | Avvio login popup, JSON `{ "level": "L2", "requestId": "..." }` |
+| `POST /api/magic-link/generate` | Genera un JWE monouso, richiede Bearer JWT valido |
+| `POST /api/magic-link` | Login custom, JSON `{ "jwe": "..." }`, restituisce `{ "token", "session" }` |
 | `GET /api/session` | Identita' e metadati del JWT, richiede Bearer |
 | `GET /api/example` | Esempio di API protetta, richiede Bearer |
 | `POST /api/logout` | Revoca della sessione corrente, richiede Bearer |
@@ -158,7 +160,7 @@ non quelli di altre login e non la sessione IdP. Il record PostgreSQL viene
 conservato per una futura correlazione con audit log; gli audit log non sono
 ancora implementati. La UI dimentica il JWT solo dopo il successo del logout.
 
-Redis e' un servizio dedicato alla denylist delle sessioni, non la
+Redis e' un servizio dedicato alla denylist e ai magic link monouso, non la
 `secondaryStorage` delle sessioni Better Auth: le sessioni restano in PostgreSQL.
 Se Redis o PostgreSQL necessari all'operazione non sono disponibili, le API
 restituiscono **503**, non autorizzano richieste e non simulano un logout riuscito.
@@ -173,6 +175,51 @@ JWT gia' revocati fino alla loro scadenza; prima di riaprire il traffico,
 ricostruire la denylist dalle sessioni con `revokedAt` o attendere la scadenza
 di tutti i JWT emessi. In produzione servono autenticazione/TLS, backup e
 una strategia di disponibilita'/ripristino per entrambi i database.
+
+## Login custom tramite magic link
+
+Applicare prima `npm run db:migrate`: la migrazione `002_magic_link.sql`
+consente sessioni senza livello SPID, mantenendo invariati i vincoli per OIDC.
+
+Il provider custom usa le stesse sessioni PostgreSQL, firma RS256 Better Auth,
+JWKS e revoca dei JWT OIDC, senza discovery o contatto con l'IdP.
+Non invia email e non genera URL: il JWE e' una credenziale da consegnare
+tramite un canale sicuro e presentare nel body JSON.
+
+1. `POST /api/magic-link/generate` con `Authorization: Bearer <JWT>` verifica
+   il JWT attivo e la sessione sorgente. Risponde con
+   `{ "jwe": "...", "expiresAt": "..." }`; il JWE dura **86.400 secondi**.
+2. `POST /api/magic-link` con `Content-Type: application/json` e
+   `{ "jwe": "..." }` riscatta la credenziale una sola volta.
+3. Viene creata una nuova sessione indipendente di **3.600 secondi** e
+   restituito `{ "token": "...", "session": { ... } }`.
+
+Il JWE usa `dir`/`A256GCM`, con chiave derivata tramite HKDF-SHA256 dal segreto
+risolto nativamente da Better Auth (`BETTER_AUTH_SECRET`) e contesto dedicato.
+E' cifrato e autenticato, non un JWS firmato. Issuer, audience specifica,
+purpose, tipo, scadenza e riferimento alla sessione vengono verificati.
+Non contiene il JWT sorgente o token dell'IdP.
+
+La sorgente puo' essere scaduta al riscatto, ma deve esistere e non essere
+revocata. Il record PostgreSQL conservato permette di rilevare una revoca
+anche dopo la scadenza della relativa chiave Redis.
+Dopo il riscatto, la nuova sessione ha revoca e scadenza indipendenti:
+revocare la sorgente non revoca retroattivamente la nuova sessione.
+
+Il JWT mantiene struttura, identita', issuer/audience e durata dei JWT OIDC,
+ma `session.provider` e' `magic-link`, `session.level` e' `null` e
+`session.acr`/`session.authTime` sono assenti. Non attesta SPID L2/L3:
+i servizi che richiedono quel livello devono rifiutarlo.
+Un JWT magic-link attivo puo' generare a sua volta un nuovo magic link;
+questo flusso consente quindi di proseguire l'accesso oltre la login SPID
+originaria senza attestare una nuova autenticazione SPID.
+
+Redis conserva `magic-link:<jti>` fino alla scadenza; il consumo atomico
+impedisce replay e riscatti concorrenti. Se un errore avviene dopo il consumo,
+il link resta consumato e l'API segnala il fallimento: non viene ripristinato.
+Gli errori infrastrutturali restituiscono 503. Non registrare JWE/JWT o body
+degli endpoint nei log; non inserirli negli URL. Non esiste autenticazione
+tramite cookie ne' viene introdotto storage persistente nel frontend.
 
 ## Dev Container e HTTPS
 

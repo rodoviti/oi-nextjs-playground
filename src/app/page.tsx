@@ -133,7 +133,9 @@ export default function Home() {
       {error && <p className="error" role="alert">{error}</p>}
       <section aria-labelledby="session-title">
         <h2 id="session-title">Sessione</h2>
-        <p role="status">{session ? `Utente autenticato - SPID ${session.level}` : "Utente non autenticato"}</p>
+        <p role="status">{session
+          ? session.provider === "magic-link" ? "Utente autenticato - Magic link" : `Utente autenticato - SPID ${session.level}`
+          : "Utente non autenticato"}</p>
         {session ? <>
           <p>Scadenza assoluta: <time dateTime={session.expires}>{session.expires}</time></p>
           <pre aria-label="Dettagli della sessione">{JSON.stringify(session, null, 2)}</pre>

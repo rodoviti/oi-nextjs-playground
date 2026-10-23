@@ -24,6 +24,10 @@ function tokenAuth() {
   });
 }
 
+export async function tokenAuthContext() {
+  return tokenAuth().$context;
+}
+
 export async function publicJwks() {
   return tokenAuth().api.getJwks();
 }
@@ -111,8 +115,7 @@ function readSessionClaim(value: unknown): AppSession {
   if (
     !value || typeof value !== "object" ||
     !("id" in value) || typeof value.id !== "string" ||
-    !("level" in value) || (value.level !== "L2" && value.level !== "L3") ||
-    !("acr" in value) || typeof value.acr !== "string" ||
+    !("level" in value) ||
     !("provider" in value) || typeof value.provider !== "string" ||
     !("startedAt" in value) || typeof value.startedAt !== "string" ||
     !("expires" in value) || typeof value.expires !== "string" ||
@@ -122,11 +125,19 @@ function readSessionClaim(value: unknown): AppSession {
     !("email" in value.user) || typeof value.user.email !== "string" ||
     ("authTime" in value && typeof value.authTime !== "number")
   ) throw new HttpError(401, "Metadati JWT non validi");
+  if (value.provider === "magic-link") {
+    if (value.level !== null || "acr" in value || "authTime" in value) {
+      throw new HttpError(401, "Metadati magic link non validi");
+    }
+  } else if (
+    (value.level !== "L2" && value.level !== "L3") ||
+    !("acr" in value) || typeof value.acr !== "string"
+  ) throw new HttpError(401, "Metadati SPID non validi");
   return {
     id: value.id,
     user: { id: value.user.id, name: value.user.name, email: value.user.email },
-    level: value.level,
-    acr: value.acr,
+    level: value.level === "L2" || value.level === "L3" ? value.level : null,
+    ...("acr" in value && typeof value.acr === "string" ? { acr: value.acr } : {}),
     provider: value.provider,
     startedAt: value.startedAt,
     expires: value.expires,

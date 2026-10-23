@@ -37,6 +37,18 @@ describe("Persistent session projection", () => {
     expect(projectSession(data(), { name: "", email: "" })).not.toHaveProperty("authTime");
     expect(projectSession({ ...data(), authTime: 123 }, { name: "", email: "" }).authTime).toBe(123);
   });
+
+  it("projects magic-link sessions without SPID assurance and rejects forged assurance", () => {
+    const magic = { ...data(), provider: "magic-link", level: null, acr: null };
+    expect(projectSession(magic, { name: "", email: "" })).toMatchObject({
+      provider: "magic-link", level: null,
+    });
+    expect(projectSession(magic, { name: "", email: "" })).not.toHaveProperty("acr");
+    for (const invalid of [{ level: "L2" as const }, { acr: "spid-l2" }, { authTime: 123 }]) {
+      expect(() => projectSession({ ...magic, ...invalid }, { name: "", email: "" }))
+        .toThrow("must not assert SPID");
+    }
+  });
 });
 
 describe("Bearer-only auth responses", () => {
